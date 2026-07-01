@@ -60,3 +60,7 @@ The stream must output the user's transcribed text first, followed by a unique s
 ## License
 
 This project is open-source and available under the MIT License.
+
+## Ongoing Work
+
+Currently I am working on building a RAG with memory architecture which will be added to this application to make it more usefull while conversing about some particular dataset
