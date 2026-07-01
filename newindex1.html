@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EchoVerse — Gemma 4 Voice</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/RecordRTC/5.6.2/RecordRTC.min.js"></script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+
+  body{
+    font-family:'Segoe UI', system-ui, sans-serif;
+    background:#0a0a0f;
+    min-height:100vh;
+    display:flex;
+    justify-content:center;
+    align-items:center;
+    padding:20px;
+  }
+
+  .app{
+    width:100%;
+    max-width:420px;
+    height:90vh;
+    max-height:680px;
+    background:#0d0d14;
+    border:0.5px solid #22222e;
+    border-radius:22px;
+    display:flex;
+    flex-direction:column;
+    overflow:hidden;
+    position:relative;
+  }
+
+  /* ---- Header ---- */
+  header{
+    padding:18px 20px 14px;
+    border-bottom:0.5px solid #1c1c28;
+    flex-shrink:0;
+  }
+  .title-row{
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    gap:8px;
+    position:relative;
+    margin-bottom:12px;
+  }
+  .title-row h1{
+    font-size:17px;
+    font-weight:600;
+    color:#f0f0f8;
+    letter-spacing:0.2px;
+  }
+  .live-badge{
+    font-size:10px;
+    font-weight:700;
+    letter-spacing:0.5px;
+    color:#fff;
+    background:linear-gradient(135deg,#7F77DD,#534AB7);
+    padding:2px 8px;
+    border-radius:6px;
+  }
+  .settings-btn{
+    position:absolute;
+    right:0;
+    top:50%;
+    transform:translateY(-50%);
+    width:30px; height:30px;
+    border-radius:50%;
+    background:#15151f;
+    border:0.5px solid #2a2a3a;
+    color:#888;
+    display:flex; align-items:center; justify-content:center;
+    cursor:pointer;
+    transition:all .15s;
+  }
+  .settings-btn:hover{ border-color:#534AB7; color:#AFA9EC; }
+  .settings-btn svg{ width:15px; height:15px; stroke:currentColor; fill:none; stroke-width:1.8; }
+
+  .status-row{ display:flex; justify-content:center; }
+  .status-pill{
+    display:inline-flex; align-items:center; gap:6px;
+    background:#15151f;
+    border:0.5px solid #2a2a3a;
+    border-radius:20px;
+    padding:4px 14px;
+  }
+  .status-dot{ width:6px; height:6px; border-radius:50%; background:#444451; transition:background .2s; }
+  .status-dot.live{ background:#1D9E75; box-shadow:0 0 6px rgba(29,158,117,.6); }
+  .status-dot.proc{ background:#7F77DD; box-shadow:0 0 6px rgba(127,119,221,.6); animation:pulseDot 1s infinite; }
+  @keyframes pulseDot{ 50%{opacity:.4;} }
+  .status-text{ font-size:11.5px; color:#9b9aa6; font-weight:500; letter-spacing:.2px; }
+
+  /* ---- Language dropdown ---- */
+  .lang-menu{
+    position:absolute;
+    top:54px;
+    right:16px;
+    background:#15151f;
+    border:0.5px solid #2a2a3a;
+    border-radius:12px;
+    padding:6px;
+    display:none;
+    flex-direction:column;
+    gap:2px;
+    z-index:20;
+    box-shadow:0 8px 24px rgba(0,0,0,.4);
+  }
+  .lang-menu.open{ display:flex; }
+  .lang-opt{
+    background:none; border:none; text-align:left;
+    color:#c7c6d4; font-size:13px; padding:8px 12px;
+    border-radius:8px; cursor:pointer; font-family:inherit;
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+  }
+  .lang-opt:hover{ background:#1f1f2c; }
+  .lang-opt.active{ color:#AFA9EC; background:#1a1a2e; }
+
+  /* ---- Error ---- */
+  .err{
+    margin:10px 20px 0;
+    background:#150c0c;
+    border:0.5px solid #5b2424;
+    border-left:2px solid #E24B4A;
+    border-radius:0 8px 8px 0;
+    padding:9px 13px;
+    font-size:12px;
+    color:#F09595;
+    display:none;
+  }
+
+  /* ---- Chat area ---- */
+  .chat{
+    flex:1;
+    overflow-y:auto;
+    padding:20px 18px;
+    display:flex;
+    flex-direction:column;
+    gap:18px;
+  }
+  .chat::-webkit-scrollbar{ width:5px; }
+  .chat::-webkit-scrollbar-thumb{ background:#22222e; border-radius:4px; }
+
+  .chat-empty{
+    margin:auto;
+    text-align:center;
+    color:#46454f;
+    font-size:13px;
+    line-height:1.6;
+  }
+
+  .turn{ display:flex; flex-direction:column; gap:14px; }
+
+  .msg-row{ display:flex; flex-direction:column; gap:5px; }
+  .msg-row.user{ align-items:flex-end; }
+  .msg-row.assistant{ align-items:flex-start; }
+
+  .msg-label{
+    font-size:10.5px;
+    color:#52515c;
+    display:flex; align-items:center; gap:5px;
+    padding:0 4px;
+  }
+  .msg-label svg{ width:11px; height:11px; stroke:#52515c; fill:none; stroke-width:2; }
+
+  .bubble{
+    max-width:82%;
+    padding:11px 15px;
+    font-size:14px;
+    line-height:1.55;
+    border-radius:16px;
+    word-wrap:break-word;
+    white-space:pre-wrap;
+  }
+  .bubble.user{
+    background:linear-gradient(135deg,#7F77DD,#5b51c9);
+    color:#fff;
+    border-radius:16px 16px 4px 16px;
+  }
+  .bubble.assistant{
+    background:#16161f;
+    border:0.5px solid #232330;
+    color:#d4d4e4;
+    border-radius:16px 16px 16px 4px;
+    min-height:20px;
+  }
+  .bubble.assistant.empty::after{
+    content:'';
+    display:inline-flex;
+  }
+  .typing-dots{ display:inline-flex; gap:4px; align-items:center; padding:4px 2px; }
+  .typing-dots span{
+    width:6px; height:6px; border-radius:50%;
+    background:#534AB7;
+    animation:bounce 1.1s infinite ease-in-out;
+  }
+  .typing-dots span:nth-child(2){ animation-delay:.15s; }
+  .typing-dots span:nth-child(3){ animation-delay:.3s; }
+  @keyframes bounce{ 0%,60%,100%{ transform:translateY(0); opacity:.5;} 30%{ transform:translateY(-4px); opacity:1;} }
+
+  /* ---- Controls ---- */
+  .controls{
+    flex-shrink:0;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    gap:16px;
+    padding:18px 20px 22px;
+    border-top:0.5px solid #1c1c28;
+    background:#0d0d14;
+  }
+  .ctrl-btn{
+    width:44px; height:44px;
+    border-radius:50%;
+    background:#15151f;
+    border:0.5px solid #2a2a3a;
+    display:flex; align-items:center; justify-content:center;
+    cursor:pointer;
+    transition:all .15s;
+    flex-shrink:0;
+  }
+  .ctrl-btn svg{ width:18px; height:18px; stroke:#8d8c98; fill:none; stroke-width:1.8; }
+  .ctrl-btn:hover:not(:disabled){ border-color:#3a3a4a; }
+  .ctrl-btn:disabled{ opacity:.3; cursor:not-allowed; }
+
+  .ctrl-mic{
+    width:64px; height:64px;
+    background:linear-gradient(135deg,#7F77DD,#534AB7);
+    border:none;
+    box-shadow:0 4px 18px rgba(127,119,221,.35);
+  }
+  .ctrl-mic svg{ width:26px; height:26px; stroke:#fff; }
+  .ctrl-mic.recording{
+    animation:micPulse 1.5s infinite;
+    background:linear-gradient(135deg,#9089ea,#6c62d6);
+  }
+  @keyframes micPulse{
+    0%{ box-shadow:0 0 0 0 rgba(127,119,221,.55), 0 4px 18px rgba(127,119,221,.35);}
+    70%{ box-shadow:0 0 0 14px rgba(127,119,221,0), 0 4px 18px rgba(127,119,221,.35);}
+    100%{ box-shadow:0 0 0 0 rgba(127,119,221,0), 0 4px 18px rgba(127,119,221,.35);}
+  }
+
+  .ctrl-btn.muted-active{ background:#26181a; border-color:#5b2424; }
+  .ctrl-btn.muted-active svg{ stroke:#E89595; }
+  .ctrl-btn.speaker-off svg{ stroke:#52515c; }
+
+  @media (max-width:420px){
+    body{ padding:0; }
+    .app{ width:100%; height:100vh; max-height:none; border-radius:0; }
+  }
+</style>
+</head>
+<body>
+
+<div class="app">
+
+  <header>
+    <div class="title-row">
+      <h1>EchoVerse</h1>
+      <span class="live-badge">LIVE</span>
+      <button class="settings-btn" id="settingsBtn" aria-label="Output language" title="Output language">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </div>
+    <div class="status-row">
+      <div class="status-pill">
+        <div class="status-dot" id="statusDot"></div>
+        <span class="status-text" id="statusText">Idle</span>
+      </div>
+    </div>
+
+    <div class="lang-menu" id="langMenu">
+      <button class="lang-opt active" data-lang="English">🇬🇧 English <span>✓</span></button>
+      <button class="lang-opt" data-lang="Hindi">🇮🇳 Hindi (हिंदी)</button>
+      <button class="lang-opt" data-lang="French">🇫🇷 French (Français)</button>
+    </div>
+  </header>
+
+  <div class="err" id="errorContainer"></div>
+
+  <main class="chat" id="chat">
+    <div class="chat-empty" id="chatEmpty">Tap the mic and start speaking.<br>Your conversation will appear here.</div>
+  </main>
+
+  <footer class="controls">
+    <button class="ctrl-btn" id="clearBtn" title="Clear conversation">
+      <svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+    </button>
+    <button class="ctrl-btn" id="discardBtn" title="Discard current recording" disabled>
+      <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+    </button>
+    <button class="ctrl-btn ctrl-mic" id="micBtn" aria-label="Toggle recording" title="Record">
+      <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+    </button>
+    <button class="ctrl-btn" id="copyBtn" title="Copy last reply" disabled>
+      <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+    </button>
+    <button class="ctrl-btn" id="stopBtn" title="Stop response" disabled>
+      <svg viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+    </button>
+  </footer>
+
+</div>
+
+<script>
+class EchoVerse {
+  constructor(){
+    this.mediaRecorder = null;
+    this.stream = null;
+    this.isRecording = false;
+    this.abortController = null;
+    this.discardCurrent = false;
+    this.selectedLanguage = "English";
+
+    this.el = {
+      micBtn: document.getElementById('micBtn'),
+      discardBtn: document.getElementById('discardBtn'),
+      stopBtn: document.getElementById('stopBtn'),
+      copyBtn: document.getElementById('copyBtn'),
+      clearBtn: document.getElementById('clearBtn'),
+      settingsBtn: document.getElementById('settingsBtn'),
+      langMenu: document.getElementById('langMenu'),
+      statusDot: document.getElementById('statusDot'),
+      statusText: document.getElementById('statusText'),
+      chat: document.getElementById('chat'),
+      chatEmpty: document.getElementById('chatEmpty'),
+      errorContainer: document.getElementById('errorContainer'),
+    };
+
+    this.lastAssistantBubble = null;
+    this.lastAssistantText = "";
+
+    this.bindEvents();
+  }
+
+  bindEvents(){
+    this.el.micBtn.addEventListener('click', () => this.toggleRecording());
+    this.el.discardBtn.addEventListener('click', () => this.discardRecording());
+    this.el.stopBtn.addEventListener('click', () => this.stopResponse());
+    this.el.copyBtn.addEventListener('click', () => this.copyLastReply());
+    this.el.clearBtn.addEventListener('click', () => this.clearChat());
+    this.el.settingsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.el.langMenu.classList.toggle('open');
+    });
+    document.addEventListener('click', (e) => {
+      if (!this.el.langMenu.contains(e.target) && e.target !== this.el.settingsBtn) {
+        this.el.langMenu.classList.remove('open');
+      }
+    });
+    this.el.langMenu.querySelectorAll('.lang-opt').forEach(opt => {
+      opt.addEventListener('click', () => {
+        this.selectedLanguage = opt.dataset.lang;
+        this.el.langMenu.querySelectorAll('.lang-opt').forEach(o => {
+          o.classList.remove('active');
+          o.innerHTML = o.innerHTML.replace(' <span>✓</span>', '');
+        });
+        opt.classList.add('active');
+        opt.innerHTML += ' <span>✓</span>';
+        this.el.langMenu.classList.remove('open');
+      });
+    });
+  }
+
+  async toggleRecording(){
+    if (this.isRecording) { this.stopRecording(); } else { this.startRecording(); }
+  }
+
+  async startRecording(){
+    try{
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      this.mediaRecorder = new RecordRTC(this.stream, {
+        type: 'audio',
+        mimeType: 'audio/wav',
+        recorderType: RecordRTC.StereoAudioRecorder,
+        desiredSampRate: 16000,
+        numberOfAudioChannels: 1
+      });
+      this.mediaRecorder.startRecording();
+      this.isRecording = true;
+      this.discardCurrent = false;
+
+      this.el.micBtn.classList.add('recording');
+      this.el.discardBtn.disabled = false;
+      this.updateStatus('Recording...', 'live');
+      this.clearError();
+    }catch(error){
+      this.showError('Microphone access denied: ' + error.message);
+      this.updateStatus('Idle', 'idle');
+    }
+  }
+
+  stopRecording(){
+    if (!this.mediaRecorder) return;
+    this.mediaRecorder.stopRecording(() => {
+      const audioBlob = this.mediaRecorder.getBlob();
+      this.stream.getTracks().forEach(track => track.stop());
+      if (!this.discardCurrent) {
+        this.transcribeAudio(audioBlob);
+      } else {
+        this.updateStatus('Idle', 'idle');
+      }
+    });
+    this.isRecording = false;
+    this.el.micBtn.classList.remove('recording');
+    this.el.discardBtn.disabled = true;
+  }
+
+  discardRecording(){
+    if (this.isRecording) {
+      this.discardCurrent = true;
+      this.stopRecording();
+    }
+  }
+
+  stopResponse(){
+    if (this.abortController) {
+      this.abortController.abort();
+    }
+  }
+
+  addTurnSkeleton(){
+    this.el.chatEmpty.style.display = 'none';
+
+    const turn = document.createElement('div');
+    turn.className = 'turn';
+
+    const userRow = document.createElement('div');
+    userRow.className = 'msg-row user';
+    userRow.innerHTML = `
+      <div class="msg-label">You <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5"/></svg></div>
+      <div class="bubble user" id="userBubble-pending"></div>
+    `;
+
+    const aiRow = document.createElement('div');
+    aiRow.className = 'msg-row assistant';
+    aiRow.innerHTML = `
+      <div class="msg-label">Gemma 4</div>
+      <div class="bubble assistant empty" id="aiBubble-pending"><div class="typing-dots"><span></span><span></span><span></span></div></div>
+    `;
+
+    turn.appendChild(userRow);
+    turn.appendChild(aiRow);
+    this.el.chat.appendChild(turn);
+
+    const userBubble = userRow.querySelector('.bubble');
+    const aiBubble = aiRow.querySelector('.bubble');
+    userBubble.removeAttribute('id');
+    aiBubble.removeAttribute('id');
+
+    this.el.chat.scrollTop = this.el.chat.scrollHeight;
+    return { userBubble, aiBubble };
+  }
+
+  async transcribeAudio(audioBlob){
+    const { userBubble, aiBubble } = this.addTurnSkeleton();
+    this.updateStatus('Processing audio...', 'proc');
+    this.el.stopBtn.disabled = false;
+
+    this.abortController = new AbortController();
+
+    try{
+      const formData = new FormData();
+      formData.append("audio", audioBlob, "input.wav");
+      formData.append("language", this.selectedLanguage);
+
+      const response = await fetch("http://127.0.0.1:5000/api/chat", {
+        method: "POST",
+        body: formData,
+        signal: this.abortController.signal
+      });
+
+      if (!response.ok) throw new Error(`Server returned status code: ${response.status}`);
+
+      const contentType = response.headers.get("content-type");
+      if (contentType && contentType.includes("application/json")) {
+        const data = await response.json();
+        if (data.error) this.showError("Server Error: " + data.error);
+        this.updateStatus('Idle', 'idle');
+        this.el.stopBtn.disabled = true;
+        return;
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+
+      let fullStreamData = "";
+      let hasSplit = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        fullStreamData += chunk;
+
+        if (!hasSplit && fullStreamData.includes("±")) {
+          hasSplit = true;
+          aiBubble.classList.remove('empty');
+          aiBubble.textContent = "";
+          this.updateStatus('Gemma is typing...', 'live');
+        }
+
+        if (hasSplit) {
+          const parts = fullStreamData.split("±");
+          userBubble.textContent = parts[0];
+          aiBubble.textContent = parts[1];
+          this.lastAssistantText = parts[1];
+          this.el.chat.scrollTop = this.el.chat.scrollHeight;
+        } else {
+          userBubble.textContent = fullStreamData;
+        }
+      }
+
+      if (!hasSplit) {
+        userBubble.textContent = fullStreamData || "(no speech detected)";
+        aiBubble.classList.remove('empty');
+        aiBubble.textContent = "—";
+      }
+
+      this.el.copyBtn.disabled = !this.lastAssistantText;
+      this.updateStatus('Idle', 'idle');
+    }catch(error){
+      if (error.name === 'AbortError') {
+        aiBubble.classList.remove('empty');
+        if (!aiBubble.textContent) aiBubble.textContent = "(stopped)";
+        this.updateStatus('Idle', 'idle');
+      } else {
+        this.showError('Connection failed: ' + error.message);
+        aiBubble.classList.remove('empty');
+        aiBubble.textContent = "(failed to respond)";
+        this.updateStatus('Idle', 'idle');
+      }
+    } finally {
+      this.el.stopBtn.disabled = true;
+      this.abortController = null;
+    }
+  }
+
+  copyLastReply(){
+    if (!this.lastAssistantText) return;
+    navigator.clipboard.writeText(this.lastAssistantText).then(() => {
+      const btn = this.el.copyBtn;
+      const orig = btn.innerHTML;
+      btn.innerHTML = '<svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>';
+      setTimeout(() => { btn.innerHTML = orig; }, 1500);
+    });
+  }
+
+  clearChat(){
+    this.el.chat.querySelectorAll('.turn').forEach(t => t.remove());
+    this.el.chatEmpty.style.display = 'block';
+    this.lastAssistantText = "";
+    this.el.copyBtn.disabled = true;
+  }
+
+  updateStatus(text, state){
+    this.el.statusText.textContent = text;
+    const dot = this.el.statusDot;
+    dot.className = 'status-dot';
+    if (state === 'live') dot.classList.add('live');
+    if (state === 'proc') dot.classList.add('proc');
+  }
+
+  showError(message){
+    const c = this.el.errorContainer;
+    c.textContent = message;
+    c.style.display = 'block';
+    setTimeout(() => { c.style.display = 'none'; }, 5000);
+  }
+
+  clearError(){
+    this.el.errorContainer.style.display = 'none';
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => { new EchoVerse(); });
+</script>
+</body>
+</html>
