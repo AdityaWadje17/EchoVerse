@@ -1,12 +1,11 @@
-# EchoVerse — Live AI converation tool
+# EchoVerse — Live AI Conversation tool
 
-EchoVerse is a sleek, dark-themed web interface for voice-based AI interactions. It allows users to record their voice, send the audio to a local backend, and view real-time streaming responses from an AI (like Gemma 4).
+EchoVerse is a sleek interface for voice-based AI interactions. It allows users to record their voice, send the audio to a local backend, and view real-time streaming responses from an AI
 
 ## Features
 
 * **Voice Recording:** Uses `RecordRTC` to capture high-quality stereo audio directly from the browser.
 * **Live Streaming Responses:** Handles chunked text streaming from the backend, displaying the user's transcribed text and the AI's response in real-time.
-* **Language Selection:** Built-in toggle to switch between English, Hindi, and French.
 * **Session Controls:** Options to discard a current recording, stop an ongoing AI response, copy the latest reply, or clear the conversation history.
 * **Responsive Dark UI:** A mobile-friendly, modern design with status indicators, typing animations, and intuitive chat bubbles. Now features a dynamic light mode toggle and an animated ambient starfield background.
 * **Continuous Live Mode:** Includes a custom `VoiceActivityDetector` for hands-free, continuous conversation without needing to repeatedly click the record button.
@@ -18,7 +17,7 @@ EchoVerse is a sleek, dark-themed web interface for voice-based AI interactions.
 Because this project is purely a frontend interface, it requires a companion backend server to function.
 
 * A modern web browser with microphone permissions enabled.
-* A local backend server running on `http://127.0.0.1:5000`.
+* A local backend server 
 * Python installed locally with dependencies for the backend (e.g., PyTorch, Transformers, faster-whisper, onnxruntime).
 * A Hugging Face token saved in your local `.env` file to authenticate model downloads.
 
@@ -87,6 +86,9 @@ The stream sends chunks using the following byte structure:
 * **Vanilla JavaScript:** DOM manipulation, event handling, and Fetch API streams.
 * **RecordRTC:** Third-party library (loaded via CDN) for reliable cross-browser audio recording.
 * **Backend / Machine Learning:** Python, Flask, PyTorch, faster-whisper, and Kokoro TTS via ONNX.
+* **STT used:** Whisper (Faster).
+* **TTS used:** Kokoro.
+* **Gemma 4 mode:** E2B.
 
 ## License
 
