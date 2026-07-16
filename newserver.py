@@ -1,6 +1,6 @@
 import os
-# SECURITY: never hardcode tokens in source. Set this in your shell/.env instead:
-#   export HF_TOKEN=hf_xxx...
+from dotenv import load_dotenv
+load_dotenv()
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
 import io
