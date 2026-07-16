@@ -1,4 +1,4 @@
-# EchoVerse — Live AI converation tool
+# EchoVerse — Live AI Conversation tool
 
 EchoVerse is a sleek, dark-themed web interface for voice-based AI interactions. It allows users to record their voice, send the audio to a local backend, and view real-time streaming responses from an AI (like Gemma 4).
 
