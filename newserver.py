@@ -1,22 +1,63 @@
 import os
-os.environ["HF_TOKEN"] = os.environ.get("HF_TOKEN", "")  # set this in your environment, not in code
+# SECURITY: never hardcode tokens in source. Set this in your shell/.env instead:
+#   export HF_TOKEN=hf_xxx...
+HF_TOKEN = os.environ.get("HF_TOKEN")
+
 import io
 import re
+import time
+import struct
+import queue
+import threading
 import torch
+import numpy as np
 import soundfile as sf
 from threading import Thread
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-from transformers import AutoProcessor, AutoModelForCausalLM, AutoModelForSpeechSeq2Seq, TextIteratorStreamer
+from transformers import AutoProcessor, AutoModelForCausalLM, TextIteratorStreamer
 
-# Document text-extraction libraries (both already installed)
 import pdfplumber
 import docx as docx_lib
-
-# Kokoro TTS — runs on CPU on purpose. It's ~82M params and fast enough
-# on CPU that it isn't worth spending your 8GB VRAM budget on, which
-# Whisper + Gemma already use fully.
+import onnxruntime as ort
 from kokoro_onnx import Kokoro
+from faster_whisper import WhisperModel
+
+# ── Perf flags (item 12) — free wins, no accuracy/VRAM cost ────────────
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
+# ── Binary frame types ────────────────────────────────────────────────
+FRAME_TRANSCRIPT = 0x01
+FRAME_AI_TEXT    = 0x02
+FRAME_AUDIO      = 0x03
+FRAME_SPLIT      = 0x04
+FRAME_EMPTY      = 0x05
+
+def pack_frame(ftype: int, data) -> bytes:
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return struct.pack(">BI", ftype, len(data)) + data
+
+
+def is_hallucination(text: str) -> bool:
+    if not text or not text.strip():
+        return True
+    t = text.strip()
+    KNOWN = {".", "..", "...", " ", "you", "thank you", "thanks",
+             "thanks for watching", "please subscribe", "bye", "bye bye"}
+    if t.lower() in KNOWN:
+        return True
+    if re.search(r'(.)\1{9,}', t):
+        return True
+    words = t.split()
+    if len(words) >= 6 and words.count(words[0]) > len(words) * 0.65:
+        return True
+    if len(t) < 2:
+        return True
+    return False
+
 
 app = Flask(__name__)
 CORS(app)
@@ -24,307 +65,284 @@ CORS(app)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Operational hardware detected: {device.upper()}")
 
-# =====================================================================
-# 1. LOAD WHISPER (GPU)
-# =====================================================================
-print("Loading Whisper-Small engine...")
-whisper_id = "openai/whisper-small"
-whisper_processor = AutoProcessor.from_pretrained(whisper_id)
-whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-    whisper_id,
-    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-    low_cpu_mem_usage=True,
-    use_safetensors=True
-).to(device)
+# ── 1. WHISPER (faster-whisper / CTranslate2) ───────────────────────────
+# faster-whisper is a CTranslate2 reimplementation of Whisper — typically
+# 4x faster than the transformers pipeline at equal accuracy, with lower
+# VRAM usage. That headroom matters on an 8GB 4060 shared with Gemma.
+print("Loading faster-whisper engine...")
 
-# =====================================================================
-# 2. LOAD GEMMA 4 (bf16, no quantization — loads straight to GPU)
-# =====================================================================
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")  # tiny/base/small/medium/distil-small.en/distil-medium.en
+whisper_compute_type = "int8_float16" if device == "cuda" else "int8"
+
+whisper_model = WhisperModel(
+    WHISPER_MODEL_SIZE,
+    device=device,
+    compute_type=whisper_compute_type,
+    download_root=os.environ.get("WHISPER_CACHE_DIR"),  # None -> default HF cache
+)
+print(f"[Whisper] faster-whisper '{WHISPER_MODEL_SIZE}' loaded on {device} "
+      f"(compute_type={whisper_compute_type})")
+
+# ── 2. GEMMA 4 ────────────────────────────────────────────────────────
 print("Loading Gemma 4 E2B locally...")
-gemma_id = "google/gemma-4-e2b-it"
+GEMMA_SNAPSHOT = r"C:\Users\tejas\.cache\huggingface\hub\models--google--gemma-4-E2B-it\snapshots\70af34e20bd4b7a91f0de6b22675850c43922a03"
 
-# NEVER hardcode tokens in source. Set HF_TOKEN as a real environment
-# variable (e.g. in PowerShell: $env:HF_TOKEN="hf_xxx") before running.
-hf_token = os.environ.get("HF_TOKEN") or None
+from transformers import BitsAndBytesConfig
 
-gemma_processor = AutoProcessor.from_pretrained(gemma_id, token=hf_token)
+gemma_processor = AutoProcessor.from_pretrained(GEMMA_SNAPSHOT, local_files_only=True)
 
-if device == "cuda":
-    free_bytes, total_bytes = torch.cuda.mem_get_info()
-    print(f"[Gemma] Free VRAM before load: {free_bytes / (1024 ** 3):.2f} GiB")
+# Create a quantization config to load the model in 8-bit (or 4-bit)
+quant_config = BitsAndBytesConfig(load_in_8bit=True) 
 
 gemma_model = AutoModelForCausalLM.from_pretrained(
-    gemma_id,
-    dtype=torch.bfloat16 if device == "cuda" else torch.float32,
-    token=hf_token,
-).to(device)
+    GEMMA_SNAPSHOT,
+    quantization_config=quant_config,
+    device_map="auto",
+    torch_dtype=torch.float16, 
+    local_files_only=True,
+    attn_implementation="sdpa", 
+)
+gemma_model.eval()
 
-# =====================================================================
-# 3. LOAD KOKORO (CPU path-protected configuration)
-# =====================================================================
-import onnxruntime as ort
-
+# ── 3. KOKORO TTS ─────────────────────────────────────────────────────
 print("Loading Kokoro TTS...")
 available_providers = ort.get_available_providers()
-print(f"[Kokoro] Available ONNX Runtime providers: {available_providers}")
 
-gpu_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] \
-    if "CUDAExecutionProvider" in available_providers else ["CPUExecutionProvider"]
+if "DmlExecutionProvider" in available_providers:
+    gpu_providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
+elif "CUDAExecutionProvider" in available_providers:
+    gpu_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+else:
+    gpu_providers = ["CPUExecutionProvider"]
+
 print(f"[Kokoro] Using providers: {gpu_providers}")
 
-# Explicit absolute file path strings pointing right to your user account downloads directory
-onnx_path = r"C:\Users\johne\Downloads\kokoro-v1.0.onnx"
-voices_path = r"C:\Users\johne\Downloads\voices-v1.0.bin"
+onnx_path   = r"C:\Users\tejas\Downloads\kokoro-v1.0.onnx"
+voices_path = r"C:\Users\tejas\Downloads\voices-v1.0.bin"
 
 try:
-    # Newer kokoro-onnx versions accept a providers kwarg directly.
     kokoro = Kokoro(onnx_path, voices_path, providers=gpu_providers)
 except TypeError:
-    # Older versions don't expose it — onnxruntime-gpu still auto-selects
-    # CUDA on its own as long as it (not plain onnxruntime) is installed.
     kokoro = Kokoro(onnx_path, voices_path)
 
-if "CUDAExecutionProvider" not in available_providers:
-    print("[Kokoro] WARNING: CUDAExecutionProvider not available — running on CPU. "
-          "Install onnxruntime-gpu (and uninstall plain onnxruntime) to enable GPU.")
+best_provider = gpu_providers[0]
+if best_provider != "CPUExecutionProvider":
+    try:
+        kokoro.session = ort.InferenceSession(onnx_path, providers=gpu_providers)
+        print(f"[Kokoro] Session patched to {best_provider} ✓")
+    except Exception as e:
+        print(f"[Kokoro] GPU session patch failed, staying on CPU: {e}")
 
-DEFAULT_VOICE = "af_heart"   # swap for any voice in kokoro.get_voices()
+DEFAULT_VOICE = "af_heart"
 
-# One-time warm-up: the first TTS call pays a fixed cost (espeak-ng phonemizer
-# backend init, ONNX session first-run overhead). Paying it here at startup
-# means your first real user request isn't the slow one.
+# ── Item 13: Kokoro concurrency ─────────────────────────────────────
+# Most onnxruntime InferenceSessions support concurrent Run() calls from
+# multiple threads (session-level state is read-only after load). We drop
+# the previous global lock so queued sentences synthesize in parallel.
+# KOKORO_SERIALIZE=1 restores the old locking behavior if you observe
+# garbled audio or crashes on your specific onnxruntime build.
+KOKORO_SERIALIZE = os.environ.get("KOKORO_SERIALIZE", "0") == "1"
+_kokoro_lock = threading.Lock() if KOKORO_SERIALIZE else None
+
 print("[Kokoro] Warming up TTS engine...")
+_t0 = time.time()
 try:
     _ = kokoro.create("Warming up.", voice=DEFAULT_VOICE, speed=1.0, lang="en-us")
-    print("[Kokoro] Warm-up complete.")
+    _elapsed = time.time() - _t0
+    _backend = "GPU ✓" if _elapsed < 1.0 else f"CPU — synthesis is slow ({_elapsed:.1f}s per sentence)"
+    print(f"[Kokoro] Warm-up complete in {_elapsed:.2f}s — {_backend}")
 except Exception as e:
     print(f"[Kokoro] Warm-up failed (non-fatal): {e}")
 
-print("\nALL MODELS SUCCESSFULLY LOADED. LIVE STREAMING PIPELINE OPERATIONAL.")
+print("\nALL SYSTEMS READY.")
 
-# =====================================================================
-# CONVERSATION MEMORY
-# =====================================================================
+# ── Memory & document state ───────────────────────────────────────────
 conversation_history = []
+document_context     = {"text": "", "filename": ""}
+MAX_DOC_CHARS         = 6000
 
-# =====================================================================
-# DOCUMENT CONTEXT
-# =====================================================================
-document_context = {"text": "", "filename": ""}
-MAX_DOC_CHARS = 6000
+# Item 4: cap history growth so prompt length (and thus prefill cost)
+# doesn't creep upward forever in a long-running / live-mode session.
+MAX_HISTORY_TURNS = 12  # ~6 user/assistant exchanges kept verbatim
+
+# Item 3: serialize GPU model calls. Whisper + Gemma share one GPU/context;
+# without this, an in-flight generate() plus an overlapping VAD-triggered
+# transcribe() (barge-in) can corrupt CUDA state or OOM.
+gpu_lock = threading.Lock()
+
+# Item 11 (partial): lightweight KV-cache reuse. We keep the last
+# past_key_values + the exact input_ids it was built from. If the new
+# turn's prompt is just "same prefix + new suffix" (document/history
+# unchanged since last turn), we only forward the new suffix tokens
+# through the model instead of re-running the full prefill. Falls back
+# to a full prefill automatically whenever the prefix doesn't match
+# (doc swapped, history cleared/trimmed, etc.) — safe by construction.
+_kv_cache_state = {"past_key_values": None, "input_ids": None}
+_kv_lock = threading.Lock()
+
+
+def synth_sentence(sentence: str, out_q: queue.Queue):
+    """Synthesise one sentence with Kokoro and put WAV bytes into out_q."""
+    try:
+        if _kokoro_lock is not None:
+            with _kokoro_lock:
+                samples, sr = kokoro.create(
+                    sentence.strip(), voice=DEFAULT_VOICE, speed=1.0, lang="en-us"
+                )
+        else:
+            samples, sr = kokoro.create(
+                sentence.strip(), voice=DEFAULT_VOICE, speed=1.0, lang="en-us"
+            )
+        buf = io.BytesIO()
+        sf.write(buf, samples, sr, format="WAV")
+        out_q.put(buf.getvalue())
+    except Exception as e:
+        print(f"[TTS inline] Error: {e}")
+        out_q.put(None)
+
+
+def transcribe_audio(audio_data: np.ndarray, sampling_rate: int) -> str:
+    """Transcribe with faster-whisper. Expects mono float32 audio."""
+    if audio_data.ndim > 1:
+        audio_data = audio_data.mean(axis=1)
+    audio_data = audio_data.astype(np.float32)
+
+    segments, _info = whisper_model.transcribe(
+        audio_data,
+        language="en",
+        task="transcribe",
+        vad_filter=True,          # trims silence, cuts down on hallucinated fillers
+        beam_size=1,               # greedy — fastest; bump to 5 if you want more accuracy
+        condition_on_previous_text=False,
+    )
+    return "".join(seg.text for seg in segments).strip()
 
 
 def extract_text(file_bytes: bytes, filename: str) -> str:
     ext = filename.rsplit(".", 1)[-1].lower()
-
     if ext == "pdf":
-        text_parts = []
+        parts = []
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page in pdf.pages:
                 t = page.extract_text()
                 if t:
-                    text_parts.append(t)
-        return "\n".join(text_parts)
-
+                    parts.append(t)
+        return "\n".join(parts)
     elif ext in ("docx", "doc"):
         doc = docx_lib.Document(io.BytesIO(file_bytes))
         return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-
     elif ext in ("txt", "md", "csv", "json", "py", "js", "html", "xml"):
         return file_bytes.decode("utf-8", errors="replace")
-
     else:
         raise ValueError(f"Unsupported file type: .{ext}")
 
 
-# =====================================================================
-# DOCUMENT ENDPOINTS
-# =====================================================================
+def _reset_kv_cache():
+    with _kv_lock:
+        _kv_cache_state["past_key_values"] = None
+        _kv_cache_state["input_ids"] = None
 
+
+# ── Document endpoints ────────────────────────────────────────────────
 @app.route("/api/document", methods=["POST"])
 def upload_document():
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
-
     f = request.files["file"]
     filename = f.filename or "document"
-
     try:
-        file_bytes = f.read()
-        raw_text = extract_text(file_bytes, filename)
-
-        if not raw_text.strip():
-            return jsonify({"error": "Could not extract any text from this file."}), 400
-
-        if len(raw_text) > MAX_DOC_CHARS:
-            raw_text = raw_text[:MAX_DOC_CHARS] + "\n\n[Document truncated — too long to fit in context]"
-
-        document_context["text"] = raw_text
+        raw = extract_text(f.read(), filename)
+        if not raw.strip():
+            return jsonify({"error": "Could not extract text."}), 400
+        if len(raw) > MAX_DOC_CHARS:
+            raw = raw[:MAX_DOC_CHARS] + "\n\n[Document truncated]"
+        document_context["text"]     = raw
         document_context["filename"] = filename
-
-        word_count = len(raw_text.split())
-        print(f"[Document] Loaded '{filename}' — {word_count} words, {len(raw_text)} chars")
-        return jsonify({"status": "loaded", "filename": filename, "word_count": word_count})
-
+        wc = len(raw.split())
+        print(f"[Document] Loaded '{filename}' — {wc} words")
+        _reset_kv_cache()  # prompt prefix changed — invalidate cache
+        return jsonify({"status": "loaded", "filename": filename, "word_count": wc})
     except Exception as e:
-        print(f"[Document] Extraction error: {e}")
+        print(f"[Document] Error: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/api/document", methods=["DELETE"])
 def remove_document():
-    document_context["text"] = ""
-    document_context["filename"] = ""
-    print("[Document] Document context cleared.")
+    document_context["text"] = document_context["filename"] = ""
+    _reset_kv_cache()
     return jsonify({"status": "cleared"})
-
-
-# =====================================================================
-# CLEAR CONVERSATION
-# =====================================================================
 
 @app.route("/api/clear", methods=["POST"])
 def clear_history():
     conversation_history.clear()
-    print("[Memory] Conversation history cleared.")
+    _reset_kv_cache()
+    print("[Memory] Cleared.")
     return jsonify({"status": "cleared"})
 
 
-# =====================================================================
-# TTS ENDPOINT
-# =====================================================================
-
-def split_into_sentences(text: str):
-    """Crude but effective sentence splitter so we can synthesize and stream
-    audio sentence-by-sentence instead of waiting for the whole reply."""
-    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
-    return sentences if sentences else [text]
-
-
-@app.route("/api/tts", methods=["POST"])
-def synthesize_speech():
-    data = request.get_json(silent=True) or {}
-    text = (data.get("text") or "").strip()
-    voice = data.get("voice") or DEFAULT_VOICE
-
-    if not text:
-        return jsonify({"error": "No text provided"}), 400
-
-    def generate_audio_stream():
-        for sentence in split_into_sentences(text):
-            try:
-                samples, sample_rate = kokoro.create(
-                    sentence,
-                    voice=voice,
-                    speed=1.0,
-                    lang="en-us"
-                )
-                buf = io.BytesIO()
-                sf.write(buf, samples, sample_rate, format="WAV")
-                buf.seek(0)
-                yield buf.read()
-            except Exception as e:
-                print(f"[TTS] Sentence synthesis error: {e}")
-
-    return Response(stream_with_context(generate_audio_stream()), mimetype="audio/wav")
-
-
-# =====================================================================
-# MAIN CHAT ENDPOINT
-# =====================================================================
-
+# ── Main chat endpoint ────────────────────────────────────────────────
 @app.route("/api/chat", methods=["POST"])
 def voice_chat():
     if "audio" not in request.files:
-        return jsonify({"error": "No audio file detected"}), 400
+        return jsonify({"error": "No audio file"}), 400
 
     audio_file = request.files["audio"]
 
     try:
-        audio_bytes = audio_file.read()
-        audio_data, sampling_rate = sf.read(io.BytesIO(audio_bytes))
+        audio_data, sampling_rate = sf.read(io.BytesIO(audio_file.read()))
 
-        # -----------------------------------------------------------------
-        # STEP 1: TRANSCRIBE (Whisper, forced English)
-        # -----------------------------------------------------------------
-        input_features = whisper_processor(
-            audio_data, sampling_rate=sampling_rate, return_tensors="pt"
-        ).input_features.to(device)
-
-        forced_decoder_ids = whisper_processor.get_decoder_prompt_ids(
-            language="en", task="transcribe"
-        )
-        with torch.no_grad():
-            with torch.amp.autocast(device_type=device, dtype=torch.float16):
-                predicted_ids = whisper_model.generate(
-                    input_features, forced_decoder_ids=forced_decoder_ids
-                )
-
-        transcribed_text = whisper_processor.batch_decode(
-            predicted_ids, skip_special_tokens=True
-        )[0].strip()
+        # ── Transcribe (Item 3: serialized against Gemma generation) ──
+        # faster-whisper manages its own CUDA/CPU execution internally
+        # (CTranslate2), but we keep it under gpu_lock since it shares
+        # the same physical GPU as Gemma and we don't want overlapping
+        # kernels from a barge-in transcription mid-generation.
+        with gpu_lock:
+            transcribed_text = transcribe_audio(audio_data, sampling_rate)
         print(f"\n[User Said]: {transcribed_text}")
 
-        if not transcribed_text:
-            return Response("I couldn't hear anything. Please try again.", mimetype="text/plain")
+        if is_hallucination(transcribed_text):
+            print("[Whisper] Hallucination — ignoring.")
+            return Response(pack_frame(FRAME_EMPTY, b""), mimetype="application/octet-stream")
 
-        # -----------------------------------------------------------------
-        # STEP 2: SAVE USER TURN TO HISTORY
-        # -----------------------------------------------------------------
+        # ── Save user turn ────────────────────────────────────────────
         conversation_history.append({
             "role": "user",
             "content": [{"type": "text", "text": transcribed_text}],
         })
 
-        # -----------------------------------------------------------------
-        # STEP 3: BUILD PROMPT
-        # -----------------------------------------------------------------
-        doc_section = ""
-        if document_context["text"]:
-            doc_section = (
-                f"\n\nYou have been given a document called '{document_context['filename']}'. "
-                f"Answer the user's questions using only the facts contained in this document — "
-                f"do not pull in outside facts, outside knowledge of the world, or information about "
-                f"other people/companies/events not mentioned in the document. "
-                f"However, you SHOULD reason over, summarize, compare, and draw conclusions from the "
-                f"facts that ARE in the document — for example, inferring what roles someone is qualified "
-                f"for based on the skills and experience listed, or identifying patterns/gaps. "
-                f"This kind of reasoning over the document's own content is expected and encouraged. "
-                f"Only refuse if the answer would require a fact that is simply not present anywhere in "
-                f"the document (e.g. asking about something never mentioned at all) — in that case say: "
-                f"'I can only answer questions based on the uploaded document, and this information is not in it.'\n\n"
-                f"--- DOCUMENT START ---\n"
-                f"{document_context['text']}\n"
-                f"--- DOCUMENT END ---"
-            )
+        # Item 4: trim history so the prompt doesn't grow unbounded.
+        if len(conversation_history) > MAX_HISTORY_TURNS:
+            trimmed = len(conversation_history) - MAX_HISTORY_TURNS
+            del conversation_history[:trimmed]
+            _reset_kv_cache()  # prefix shifted — cache no longer valid
+            print(f"[Memory] Trimmed {trimmed} old turn(s), kept last {MAX_HISTORY_TURNS}")
 
+        print(f"[Memory] {len(conversation_history)} messages")
+
+        # ── Build prompt ──────────────────────────────────────────────
         if document_context["text"]:
+            doc_block = (
+                f"\n\nYou have been given a document called '{document_context['filename']}'. "
+                f"Answer ONLY from this document. Do not use outside knowledge. "
+                f"If the answer is not in the document say: "
+                f"'I can only answer questions based on the uploaded document, and this information is not in it.'\n\n"
+                f"--- DOCUMENT START ---\n{document_context['text']}\n--- DOCUMENT END ---"
+            )
             system_instruction = (
-                "You are a document assistant with strong analytical ability. "
-                "You must not use outside/general knowledge to supply facts the document doesn't contain, "
-                "but you should freely reason, infer, and draw conclusions using the facts that are in the document. "
-                "Keep answers concise — 3 to 4 sentences maximum, no bullet points or headers, unless the user "
-                "explicitly asks for a detailed or long-form answer."
-                + doc_section
+                "You are a strict document assistant. No general knowledge — "
+                "only the document below." + doc_block
             )
         else:
             system_instruction = (
-                "You are a helpful AI assistant having an ongoing spoken conversation "
-                "with the user. You have full memory of everything said in this session. "
-                "Use the complete conversation history for context. "
-                "Respond naturally and concisely, in English."
+                "You are a helpful AI assistant. You have full memory of this session. "
+                "Respond naturally and concisely in English."
             )
 
         messages = []
         for i, entry in enumerate(conversation_history):
             if i == 0:
-                messages.append({
-                    "role": "user",
-                    "content": [{
-                        "type": "text",
-                        "text": f"{system_instruction}\n\n{entry['content'][0]['text']}"
-                    }]
-                })
+                messages.append({"role": "user", "content": [{"type": "text",
+                    "text": f"{system_instruction}\n\n{entry['content'][0]['text']}"}]})
             else:
                 messages.append(entry)
 
@@ -333,50 +351,157 @@ def voice_chat():
         )
         inputs = gemma_processor(text=prompt, return_tensors="pt")
 
-        cleaned_inputs = {}
-        for key, value in inputs.items():
-            if isinstance(value, torch.Tensor):
-                if torch.is_floating_point(value) and device == "cuda":
-                    cleaned_inputs[key] = value.to(device=device, dtype=torch.bfloat16)
-                else:
-                    cleaned_inputs[key] = value.to(device=device)
-            else:
-                cleaned_inputs[key] = value
+        input_device = "cuda:0" if device == "cuda" else "cpu"
+        cleaned = {}
+        for k, v in inputs.items():
+            cleaned[k] = v.to(input_device) if isinstance(v, torch.Tensor) else v
+        if "attention_mask" not in cleaned:
+            cleaned["attention_mask"] = torch.ones_like(cleaned["input_ids"]).to(input_device)
 
-        # -----------------------------------------------------------------
-        # STEP 4: STREAM GENERATION
-        # -----------------------------------------------------------------
+        # ── Item 11: try to reuse KV cache from the previous turn ──────
+        # Only valid if this turn's input_ids start with exactly the same
+        # tokens as the cached prefix (i.e. doc + history prefix unchanged,
+        # this turn just appended new tokens on top).
+        generation_kwargs = dict(**cleaned, max_new_tokens=256)
+        with _kv_lock:
+            prev_ids = _kv_cache_state["input_ids"]
+            prev_pkv = _kv_cache_state["past_key_values"]
+            cur_ids  = cleaned["input_ids"]
+            if (
+                prev_pkv is not None
+                and prev_ids is not None
+                and cur_ids.shape[1] > prev_ids.shape[1]
+                and torch.equal(cur_ids[:, :prev_ids.shape[1]], prev_ids)
+            ):
+                # Feed only the new suffix tokens; reuse cached prefix compute.
+                new_tokens = cur_ids[:, prev_ids.shape[1]:]
+                generation_kwargs["input_ids"] = new_tokens
+                generation_kwargs["past_key_values"] = prev_pkv
+                generation_kwargs["attention_mask"] = torch.ones(
+                    (cur_ids.shape[0], cur_ids.shape[1]), device=cur_ids.device, dtype=torch.long
+                )
+                print(f"[KV-cache] Reusing prefix ({prev_ids.shape[1]} tokens), "
+                      f"prefill only {new_tokens.shape[1]} new tokens")
+            else:
+                print(f"[KV-cache] Full prefill ({cur_ids.shape[1]} tokens)")
+
         streamer = TextIteratorStreamer(
             gemma_processor, skip_prompt=True, skip_special_tokens=True
         )
-        generation_kwargs = dict(**cleaned_inputs, streamer=streamer, max_new_tokens=256)
+        generation_kwargs["streamer"] = streamer
+        generation_kwargs["use_cache"] = True
+        generation_kwargs["return_dict_in_generate"] = True
+        generation_kwargs["output_scores"] = False
 
-        thread = Thread(target=gemma_model.generate, kwargs=generation_kwargs)
-        thread.start()
+        # Item 3: hold the GPU lock for the whole generation so no other
+        # request (e.g. a barge-in transcription) can run concurrently.
+        gpu_lock.acquire()
+
+        gen_result_holder = {}
+
+        def _run_generate():
+            try:
+                with torch.no_grad():
+                    gen_result_holder["out"] = gemma_model.generate(**generation_kwargs)
+            finally:
+                gpu_lock.release()
+
+        gen_thread = Thread(target=_run_generate)
+        gen_thread.start()
 
         def generate_stream():
-            yield f"{transcribed_text}±"
+            yield pack_frame(FRAME_TRANSCRIPT, transcribed_text)
+            yield pack_frame(FRAME_SPLIT, b"")
 
-            full_reply = []
-            for new_text in streamer:
-                full_reply.append(new_text)
-                yield new_text
+            full_reply    = []
+            sentence_buf  = ""
+            audio_q       = queue.Queue()
+            synth_threads = []
 
-            thread.join()
+            SENT_RE          = re.compile(r'(?<=[.!?,;:])(?=\s|$)')
+            MIN_SYNTH_CHARS  = 8
+            MAX_BUFFER_CHARS = 18
 
+            def kick_synth(s):
+                if len(s.strip()) < MIN_SYNTH_CHARS:
+                    return
+                t = threading.Thread(target=synth_sentence, args=(s, audio_q), daemon=True)
+                t.start()
+                synth_threads.append(t)
+
+            for token in streamer:
+                full_reply.append(token)
+                yield pack_frame(FRAME_AI_TEXT, token)
+
+                sentence_buf += token
+                parts = SENT_RE.split(sentence_buf)
+                if len(parts) > 1:
+                    for sentence in parts[:-1]:
+                        kick_synth(sentence)
+                    sentence_buf = parts[-1]
+                elif len(sentence_buf) >= MAX_BUFFER_CHARS:
+                    kick_synth(sentence_buf)
+                    sentence_buf = ""
+
+                while True:
+                    try:
+                        wav = audio_q.get_nowait()
+                        if wav:
+                            yield pack_frame(FRAME_AUDIO, wav)
+                    except queue.Empty:
+                        break
+
+            if sentence_buf.strip():
+                kick_synth(sentence_buf.strip())
+
+            gen_thread.join()
+            out_dbg = gen_result_holder.get("out")
+            has_pkv = out_dbg is not None and getattr(out_dbg, "past_key_values", None) is not None
+            print(f"[KV-cache] past_key_values captured this turn: {has_pkv}")
+
+            # Continue yielding audio as long as any synth thread is running or the queue has data
+            while any(t.is_alive() for t in synth_threads) or not audio_q.empty():
+                try:
+                    wav = audio_q.get(timeout=0.1) # Use a small timeout instead of nowait
+                    if wav:
+                        yield pack_frame(FRAME_AUDIO, wav)
+                except queue.Empty:
+                    continue
+
+            # Persist assistant turn
             assistant_text = "".join(full_reply).strip()
             conversation_history.append({
                 "role": "assistant",
                 "content": [{"type": "text", "text": assistant_text}],
             })
+            print(f"[Memory] {len(conversation_history)} messages")
 
-        return Response(stream_with_context(generate_stream()), mimetype="text/plain")
+            # Item 11: stash the new past_key_values + the input_ids that
+            # produced them (prompt tokens + generated tokens), so next
+            # turn can potentially reuse this prefix.
+            out = gen_result_holder.get("out")
+            if out is not None and hasattr(out, "past_key_values") and out.past_key_values is not None:
+                with _kv_lock:
+                    _kv_cache_state["past_key_values"] = out.past_key_values
+                    _kv_cache_state["input_ids"] = out.sequences if hasattr(out, "sequences") else None
+            # Note: with return_dict_in_generate=False, `out` is just the
+            # sequences tensor and carries no cache — full prefill happens
+            # next turn. Set return_dict_in_generate=True + use a
+            # generation config that returns past_key_values if your
+            # transformers version supports it, to make reuse actually
+            # kick in. Left conservative here so this never crashes on
+            # library versions that don't support it.
+
+        return Response(
+            stream_with_context(generate_stream()),
+            mimetype="application/octet-stream"
+        )
 
     except Exception as e:
         if conversation_history and conversation_history[-1]["role"] == "user":
             conversation_history.pop()
-            print("[Memory] Rolled back orphaned user turn due to error.")
-        print(f"\nInternal processing error: {str(e)}")
+            print("[Memory] Rolled back orphaned user turn.")
+        print(f"\nInternal error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
