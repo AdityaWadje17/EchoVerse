@@ -72,7 +72,7 @@ print(f"Operational hardware detected: {device.upper()}")
 print("Loading faster-whisper engine...")
 
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")  # tiny/base/small/medium/distil-small.en/distil-medium.en
-whisper_compute_type = "int8_float16" if device == "cuda" else "int8"
+whisper_compute_type = "float16" if device == "cuda" else "int8"
 
 whisper_model = WhisperModel(
     WHISPER_MODEL_SIZE,
@@ -87,21 +87,13 @@ print(f"[Whisper] faster-whisper '{WHISPER_MODEL_SIZE}' loaded on {device} "
 print("Loading Gemma 4 E2B locally...")
 GEMMA_SNAPSHOT = r"C:\Users\tejas\.cache\huggingface\hub\models--google--gemma-4-E2B-it\snapshots\70af34e20bd4b7a91f0de6b22675850c43922a03"
 
-from transformers import BitsAndBytesConfig
-
 gemma_processor = AutoProcessor.from_pretrained(GEMMA_SNAPSHOT, local_files_only=True)
-
-# Create a quantization config to load the model in 8-bit (or 4-bit)
-quant_config = BitsAndBytesConfig(load_in_8bit=True) 
-
 gemma_model = AutoModelForCausalLM.from_pretrained(
     GEMMA_SNAPSHOT,
-    quantization_config=quant_config,
-    device_map="auto",
-    torch_dtype=torch.float16, 
+    torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
     local_files_only=True,
-    attn_implementation="sdpa", 
-)
+    attn_implementation="sdpa",  # item 12 — faster attention kernel, no accuracy cost
+).to(device)
 gemma_model.eval()
 
 # ── 3. KOKORO TTS ─────────────────────────────────────────────────────
@@ -388,10 +380,9 @@ def voice_chat():
         streamer = TextIteratorStreamer(
             gemma_processor, skip_prompt=True, skip_special_tokens=True
         )
-        generation_kwargs["streamer"] = streamer
+        generation_kwargs["streamer"] = generation_kwargs.get("streamer", streamer)
         generation_kwargs["use_cache"] = True
-        generation_kwargs["return_dict_in_generate"] = True
-        generation_kwargs["output_scores"] = False
+        generation_kwargs["return_dict_in_generate"] = False
 
         # Item 3: hold the GPU lock for the whole generation so no other
         # request (e.g. a barge-in transcription) can run concurrently.
@@ -419,8 +410,8 @@ def voice_chat():
             synth_threads = []
 
             SENT_RE          = re.compile(r'(?<=[.!?,;:])(?=\s|$)')
-            MIN_SYNTH_CHARS  = 8
-            MAX_BUFFER_CHARS = 18
+            MIN_SYNTH_CHARS  = 12
+            MAX_BUFFER_CHARS = 45
 
             def kick_synth(s):
                 if len(s.strip()) < MIN_SYNTH_CHARS:
@@ -455,18 +446,16 @@ def voice_chat():
                 kick_synth(sentence_buf.strip())
 
             gen_thread.join()
-            out_dbg = gen_result_holder.get("out")
-            has_pkv = out_dbg is not None and getattr(out_dbg, "past_key_values", None) is not None
-            print(f"[KV-cache] past_key_values captured this turn: {has_pkv}")
 
-            # Continue yielding audio as long as any synth thread is running or the queue has data
-            while any(t.is_alive() for t in synth_threads) or not audio_q.empty():
+            for t in synth_threads:
+                t.join()
+            while True:
                 try:
-                    wav = audio_q.get(timeout=0.1) # Use a small timeout instead of nowait
+                    wav = audio_q.get_nowait()
                     if wav:
                         yield pack_frame(FRAME_AUDIO, wav)
                 except queue.Empty:
-                    continue
+                    break
 
             # Persist assistant turn
             assistant_text = "".join(full_reply).strip()

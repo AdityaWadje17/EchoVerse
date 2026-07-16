@@ -921,7 +921,7 @@ class VoiceActivityDetector {
     this.onSpeechEnd     = opts.onSpeechEnd     || (()=>{});
     this.threshold       = opts.threshold       || 0.013;
     this.minSpeechMs     = opts.minSpeechMs     || 220;
-    this.silenceMs       = opts.silenceMs       || 600;
+    this.silenceMs       = opts.silenceMs       || 1400;
     this.audioCtx        = null;
     this.analyser        = null;
     this.raf             = null;
