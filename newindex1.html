@@ -175,7 +175,6 @@
   .upload-status{ font-size:11.5px; color:var(--ink-dim); display:none; text-align:center; margin-top:8px; }
   .upload-status.show{ display:block; }
   .upload-status.error{ color:var(--coral); }
-  /* ── Live mode ── */
   .ctrl-btn.live-btn svg{ stroke:var(--violet); }
   .ctrl-btn.live-btn.live-on{
     border-color:var(--cyan);
@@ -291,7 +290,6 @@
       </div>
     </div>
 
-    <!-- Live mode status bar -->
     <div class="live-status" id="liveStatus">
       <div class="live-orb" id="liveOrb"></div>
       <span class="live-label" id="liveLabel">Listening...</span>
@@ -325,7 +323,6 @@
 </div>
 
 <script>
-/* ---------------- Ambient starfield ---------------- */
 (function(){
   const canvas = document.getElementById('space');
   const ctx = canvas.getContext('2d');
@@ -364,14 +361,14 @@
   requestAnimationFrame(draw);
 })();
 
-/* ---------------- App ---------------- */
-/* ── AudioPlayer — Web Audio API, gapless sentence-by-sentence playback ──
-   WAV chunks arrive from the binary stream already synthesised on the backend.
-   We schedule each decoded buffer to start exactly when the previous one ends.
-   Exposes onPlaybackStart/onPlaybackEnd hooks so callers can gate the mic
-   while TTS audio is actually coming out of the speakers (echo suppression
-   backstop on top of browser-level AEC — item 1).
-─────────────────────────────────────────────────────────────────────────── */
+/*
+  AudioPlayer schedules decoded WAV chunks received from the streaming
+  backend for gapless, sentence-by-sentence playback using the Web Audio
+  API. Each buffer is scheduled to begin exactly when the previous one
+  ends. Playback start and end are exposed via callbacks so the caller
+  can gate the microphone while assistant audio is actually sounding,
+  as a backstop against the mic picking up the assistant's own voice.
+*/
 class AudioPlayer {
   constructor(){
     this.ctx = null;
@@ -392,7 +389,6 @@ class AudioPlayer {
 
   reset(){ this.stopped = false; if (this.ctx && this.ctx.state !== 'closed') this.nextTime = this.ctx.currentTime; }
 
-  // wav = Uint8Array of a complete WAV file
   async enqueue(wav){
     if (this.stopped) return;
     const ctx = this._ctx();
@@ -441,14 +437,16 @@ class EchoVerse{
     this.liveVAD     = null;
     this.liveRec     = null;
     this.liveStream  = null;
-    this.liveBusy    = false; // true while waiting for backend response
-    this.ttsPlaying  = false; // true while assistant audio is actually sounding
+    this.liveBusy    = false;
+    this.ttsPlaying  = false;
 
-    // Item 1: gate live-mode speech detection while our own TTS is playing,
-    // to avoid the mic picking up Kokoro's output as new user speech.
-    // Barge-in (interrupting mid-reply) still works because the VAD keeps
-    // running — onSpeechStart during ttsPlaying triggers an interrupt below
-    // instead of being silently ignored.
+    /*
+      Live mode speech detection is gated while assistant audio is playing,
+      to prevent the microphone from picking up the assistant's own output
+      as new user speech. Barge-in still works: the voice activity detector
+      keeps running, and a speech-start event during playback is treated
+      as an interruption further down instead of being ignored.
+    */
     this.audioPlayer.onPlaybackStart = () => { this.ttsPlaying = true; };
     this.audioPlayer.onPlaybackEnd   = () => {
       this.ttsPlaying = false;
@@ -567,7 +565,6 @@ class EchoVerse{
     this.el.chat.scrollTop = this.el.chat.scrollHeight;
   }
 
-  // Item 1: AEC-enabled mic constraints, shared by manual and live recording.
   _micConstraints(){
     return {
       audio: {
@@ -671,11 +668,14 @@ class EchoVerse{
       const reader  = response.body.getReader();
       const decoder = new TextDecoder("utf-8");
 
-      // Item 14: accumulate raw chunks in an array instead of reallocating
-      // + copying the whole buffer on every incoming packet (was O(n^2)
-      // over a long stream). We only flatten into one contiguous
-      // Uint8Array when we actually need to parse a frame header/payload,
-      // and we drop already-consumed bytes instead of re-copying them.
+      /*
+        Incoming stream chunks are accumulated in an array rather than
+        reallocated and copied into a single buffer on every packet, which
+        would be quadratic in cost over a long stream. Bytes are only
+        flattened into one contiguous array when a frame needs to be
+        parsed, and consumed bytes are dropped without re-copying the
+        remainder.
+      */
       let chunks   = [];
       let totalLen = 0;
       let aiText   = "";
@@ -685,7 +685,6 @@ class EchoVerse{
         totalLen += value.length;
       };
 
-      // Flatten `chunks` into one Uint8Array (only called when parsing).
       const flatten = () => {
         if (chunks.length === 1) return chunks[0];
         const out = new Uint8Array(totalLen);
@@ -695,7 +694,6 @@ class EchoVerse{
         return out;
       };
 
-      // Drop the first `n` consumed bytes without re-copying everything.
       const consume = (n) => {
         const buf = flatten();
         const rest = buf.subarray(n);
@@ -708,7 +706,6 @@ class EchoVerse{
         if (done) break;
         appendChunk(value);
 
-        // Parse complete frames: [type:1][len:4][payload:len]
         while (totalLen >= 5){
           const buf  = flatten();
           const type = buf[0];
@@ -719,32 +716,32 @@ class EchoVerse{
           consume(5 + len);
 
           switch(type){
-            case 0x05: // EMPTY — hallucination rejected
+            case 0x05:
               turn.remove();
               if (!this.el.chat.querySelector('.turn')) this.el.chatEmpty.style.display = 'flex';
               this.updateStatus('Idle', 'idle');
               this.el.stopBtn.disabled = true;
               return;
 
-            case 0x01: // Transcript
+            case 0x01:
               userBubble.textContent = decoder.decode(payload);
               break;
 
-            case 0x04: // Split — transcript done, AI starts
+            case 0x04:
               aiBubble.classList.remove('empty');
               aiBubble.classList.add('streaming');
               aiBubble.textContent = "";
               this.updateStatus('Gemma is responding...', 'speak');
               break;
 
-            case 0x02: // AI text token
+            case 0x02:
               aiText += decoder.decode(payload);
               aiBubble.textContent = aiText;
               this.lastAssistantText = aiText;
               this.el.chat.scrollTop = this.el.chat.scrollHeight;
               break;
 
-            case 0x03: // Audio (complete WAV — synthesised on backend)
+            case 0x03:
               if (this.speechEnabled) this.audioPlayer.enqueue(payload);
               break;
           }
@@ -806,15 +803,12 @@ class EchoVerse{
   }
   clearError(){ this.el.errorContainer.classList.remove('show'); }
 
-  // ── LIVE MODE ─────────────────────────────────────────────────────
   async toggleLiveMode(){
     if (this.liveMode) this.stopLiveMode(); else await this.startLiveMode();
   }
 
   async startLiveMode(){
     try{
-      // Item 1: AEC/NS/AGC constraints — the primary defense against the
-      // mic picking up our own TTS output as new "user speech".
       this.liveStream = await navigator.mediaDevices.getUserMedia(this._micConstraints());
     }catch(e){
       this.showError('Microphone access denied: ' + e.message);
@@ -831,7 +825,6 @@ class EchoVerse{
       return r;
     };
 
-    // Start recording immediately — so we never miss the first syllable
     this.liveRec = makeRecorder();
 
     this.liveVAD = new VoiceActivityDetector({
@@ -839,14 +832,13 @@ class EchoVerse{
       onSpeechStart: () => {
         if (this.liveBusy) return;
 
-        // Item 1 (backstop): if TTS audio is currently playing, treat this
-        // as a barge-in — the user is deliberately talking over the
-        // assistant — rather than silently ignoring it (which would just
-        // let an echo loop build a queued "ghost" utterance). We stop
-        // playback/generation immediately and let the fresh utterance
-        // through normally. With good AEC this path rarely fires from
-        // true echo since the echo signal is cancelled before this
-        // callback ever gets triggered.
+        /*
+          If assistant audio is currently playing, this speech-start event
+          is treated as a deliberate interruption rather than ignored,
+          which stops playback and generation immediately. With effective
+          echo cancellation this path rarely fires from true echo, since
+          the echo signal is cancelled before detection occurs.
+        */
         if (this.ttsPlaying){
           this.stopResponse();
         }
@@ -857,7 +849,6 @@ class EchoVerse{
       },
       onSpeechEnd: () => {
         if (this.liveBusy || !this.liveRec) return;
-        // Swap recorder so next utterance starts capturing immediately
         const finished = this.liveRec;
         this.liveRec = makeRecorder();
         this.el.micBtn.classList.remove('live-speaking');
@@ -908,12 +899,14 @@ class EchoVerse{
   }
 }
 
-/* ── Voice Activity Detector ──────────────────────────────────────────
-   Monitors mic volume via Web Audio API. Fires onSpeechStart when the
-   level stays above threshold for minSpeechMs, and onSpeechEnd after
-   silenceMs of quiet. Uses a pre-existing stream so the same mic track
-   feeds both the analyser and RecordRTC — no double permission prompt.
-─────────────────────────────────────────────────────────────────────── */
+/*
+  VoiceActivityDetector monitors microphone input level using the Web
+  Audio API. It fires onSpeechStart when the level stays above threshold
+  for minSpeechMs, and onSpeechEnd after silenceMs of subsequent quiet.
+  It reuses the existing media stream so the same microphone track feeds
+  both the analyser and the recorder, avoiding a duplicate permission
+  prompt.
+*/
 class VoiceActivityDetector {
   constructor(opts = {}){
     this.stream          = opts.stream          || null;
@@ -928,8 +921,6 @@ class VoiceActivityDetector {
     this.isSpeaking      = false;
     this.speechStart     = null;
     this.silenceStart    = null;
-    // Item 16: preallocate the analysis buffer once instead of on every
-    // animation frame (this loop runs continuously at ~60fps in live mode).
     this._sampleBuf      = null;
   }
 
@@ -984,4 +975,4 @@ class VoiceActivityDetector {
 document.addEventListener('DOMContentLoaded', () => new EchoVerse());
 </script>
 </body>
-</html>.\venv\Scripts\Activate.ps1
+</html>

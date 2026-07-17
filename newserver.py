@@ -23,12 +23,12 @@ import onnxruntime as ort
 from kokoro_onnx import Kokoro
 from faster_whisper import WhisperModel
 
-# ── Perf flags (item 12) — free wins, no accuracy/VRAM cost ────────────
+# Enable TF32 and cuDNN autotuning for faster matrix operations without loss of accuracy.
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
-# ── Binary frame types ────────────────────────────────────────────────
+# Binary frame type identifiers used when streaming responses to the client.
 FRAME_TRANSCRIPT = 0x01
 FRAME_AI_TEXT    = 0x02
 FRAME_AUDIO      = 0x03
@@ -36,12 +36,14 @@ FRAME_SPLIT      = 0x04
 FRAME_EMPTY      = 0x05
 
 def pack_frame(ftype: int, data) -> bytes:
+    """Encode a frame type and payload into a length-prefixed binary frame."""
     if isinstance(data, str):
         data = data.encode("utf-8")
     return struct.pack(">BI", ftype, len(data)) + data
 
 
 def is_hallucination(text: str) -> bool:
+    """Detect common Whisper hallucination patterns in transcribed text."""
     if not text or not text.strip():
         return True
     t = text.strip()
@@ -65,25 +67,22 @@ CORS(app)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Operational hardware detected: {device.upper()}")
 
-# ── 1. WHISPER (faster-whisper / CTranslate2) ───────────────────────────
-# faster-whisper is a CTranslate2 reimplementation of Whisper — typically
-# 4x faster than the transformers pipeline at equal accuracy, with lower
-# VRAM usage. That headroom matters on an 8GB 4060 shared with Gemma.
+# Speech recognition engine (faster-whisper / CTranslate2 backend).
 print("Loading faster-whisper engine...")
 
-WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")  # tiny/base/small/medium/distil-small.en/distil-medium.en
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
 whisper_compute_type = "float16" if device == "cuda" else "int8"
 
 whisper_model = WhisperModel(
     WHISPER_MODEL_SIZE,
     device=device,
     compute_type=whisper_compute_type,
-    download_root=os.environ.get("WHISPER_CACHE_DIR"),  # None -> default HF cache
+    download_root=os.environ.get("WHISPER_CACHE_DIR"),
 )
 print(f"[Whisper] faster-whisper '{WHISPER_MODEL_SIZE}' loaded on {device} "
       f"(compute_type={whisper_compute_type})")
 
-# ── 2. GEMMA 4 ────────────────────────────────────────────────────────
+# Language model used for conversational responses.
 print("Loading Gemma 4 E2B locally...")
 GEMMA_SNAPSHOT = r"C:\Users\tejas\.cache\huggingface\hub\models--google--gemma-4-E2B-it\snapshots\70af34e20bd4b7a91f0de6b22675850c43922a03"
 
@@ -92,11 +91,11 @@ gemma_model = AutoModelForCausalLM.from_pretrained(
     GEMMA_SNAPSHOT,
     torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
     local_files_only=True,
-    attn_implementation="sdpa",  # item 12 — faster attention kernel, no accuracy cost
+    attn_implementation="sdpa",
 ).to(device)
 gemma_model.eval()
 
-# ── 3. KOKORO TTS ─────────────────────────────────────────────────────
+# Text-to-speech engine.
 print("Loading Kokoro TTS...")
 available_providers = ort.get_available_providers()
 
@@ -121,18 +120,16 @@ best_provider = gpu_providers[0]
 if best_provider != "CPUExecutionProvider":
     try:
         kokoro.session = ort.InferenceSession(onnx_path, providers=gpu_providers)
-        print(f"[Kokoro] Session patched to {best_provider} ✓")
+        print(f"[Kokoro] Session patched to {best_provider}")
     except Exception as e:
         print(f"[Kokoro] GPU session patch failed, staying on CPU: {e}")
 
 DEFAULT_VOICE = "af_heart"
 
-# ── Item 13: Kokoro concurrency ─────────────────────────────────────
-# Most onnxruntime InferenceSessions support concurrent Run() calls from
-# multiple threads (session-level state is read-only after load). We drop
-# the previous global lock so queued sentences synthesize in parallel.
-# KOKORO_SERIALIZE=1 restores the old locking behavior if you observe
-# garbled audio or crashes on your specific onnxruntime build.
+# Concurrency control for Kokoro synthesis. Most onnxruntime sessions support
+# concurrent Run() calls since session state is read-only after load, so no
+# lock is used by default. Set KOKORO_SERIALIZE=1 to force sequential
+# synthesis if issues are observed on a particular onnxruntime build.
 KOKORO_SERIALIZE = os.environ.get("KOKORO_SERIALIZE", "0") == "1"
 _kokoro_lock = threading.Lock() if KOKORO_SERIALIZE else None
 
@@ -141,40 +138,38 @@ _t0 = time.time()
 try:
     _ = kokoro.create("Warming up.", voice=DEFAULT_VOICE, speed=1.0, lang="en-us")
     _elapsed = time.time() - _t0
-    _backend = "GPU ✓" if _elapsed < 1.0 else f"CPU — synthesis is slow ({_elapsed:.1f}s per sentence)"
-    print(f"[Kokoro] Warm-up complete in {_elapsed:.2f}s — {_backend}")
+    _backend = "GPU" if _elapsed < 1.0 else f"CPU, synthesis is slow ({_elapsed:.1f}s per sentence)"
+    print(f"[Kokoro] Warm-up complete in {_elapsed:.2f}s, backend: {_backend}")
 except Exception as e:
     print(f"[Kokoro] Warm-up failed (non-fatal): {e}")
 
 print("\nALL SYSTEMS READY.")
 
-# ── Memory & document state ───────────────────────────────────────────
+# Session state: conversation memory and uploaded document context.
 conversation_history = []
 document_context     = {"text": "", "filename": ""}
 MAX_DOC_CHARS         = 6000
 
-# Item 4: cap history growth so prompt length (and thus prefill cost)
-# doesn't creep upward forever in a long-running / live-mode session.
-MAX_HISTORY_TURNS = 12  # ~6 user/assistant exchanges kept verbatim
+# Maximum number of turns retained in history to bound prompt growth over
+# the course of a long-running session.
+MAX_HISTORY_TURNS = 12
 
-# Item 3: serialize GPU model calls. Whisper + Gemma share one GPU/context;
-# without this, an in-flight generate() plus an overlapping VAD-triggered
-# transcribe() (barge-in) can corrupt CUDA state or OOM.
+# Serializes GPU-bound model calls. Whisper and Gemma share a single GPU
+# context, so an in-flight generation and an overlapping transcription
+# (e.g. triggered by barge-in) must not run concurrently.
 gpu_lock = threading.Lock()
 
-# Item 11 (partial): lightweight KV-cache reuse. We keep the last
-# past_key_values + the exact input_ids it was built from. If the new
-# turn's prompt is just "same prefix + new suffix" (document/history
-# unchanged since last turn), we only forward the new suffix tokens
-# through the model instead of re-running the full prefill. Falls back
-# to a full prefill automatically whenever the prefix doesn't match
-# (doc swapped, history cleared/trimmed, etc.) — safe by construction.
+# Lightweight KV-cache reuse: retains the last past_key_values along with
+# the exact input_ids used to produce them. If a new turn's prompt is the
+# same prefix plus a new suffix, only the suffix tokens are forwarded
+# through the model. Falls back to a full prefill whenever the prefix does
+# not match, for example after a document change or history trim.
 _kv_cache_state = {"past_key_values": None, "input_ids": None}
 _kv_lock = threading.Lock()
 
 
 def synth_sentence(sentence: str, out_q: queue.Queue):
-    """Synthesise one sentence with Kokoro and put WAV bytes into out_q."""
+    """Synthesize a single sentence with Kokoro and push the resulting WAV bytes to out_q."""
     try:
         if _kokoro_lock is not None:
             with _kokoro_lock:
@@ -194,7 +189,7 @@ def synth_sentence(sentence: str, out_q: queue.Queue):
 
 
 def transcribe_audio(audio_data: np.ndarray, sampling_rate: int) -> str:
-    """Transcribe with faster-whisper. Expects mono float32 audio."""
+    """Transcribe mono float32 audio using faster-whisper."""
     if audio_data.ndim > 1:
         audio_data = audio_data.mean(axis=1)
     audio_data = audio_data.astype(np.float32)
@@ -203,14 +198,15 @@ def transcribe_audio(audio_data: np.ndarray, sampling_rate: int) -> str:
         audio_data,
         language="en",
         task="transcribe",
-        vad_filter=True,          # trims silence, cuts down on hallucinated fillers
-        beam_size=1,               # greedy — fastest; bump to 5 if you want more accuracy
+        vad_filter=True,
+        beam_size=1,
         condition_on_previous_text=False,
     )
     return "".join(seg.text for seg in segments).strip()
 
 
 def extract_text(file_bytes: bytes, filename: str) -> str:
+    """Extract plain text from an uploaded document based on its file extension."""
     ext = filename.rsplit(".", 1)[-1].lower()
     if ext == "pdf":
         parts = []
@@ -230,14 +226,16 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
 
 
 def _reset_kv_cache():
+    """Invalidate the cached KV state, forcing a full prefill on the next generation."""
     with _kv_lock:
         _kv_cache_state["past_key_values"] = None
         _kv_cache_state["input_ids"] = None
 
 
-# ── Document endpoints ────────────────────────────────────────────────
+# Document management endpoints.
 @app.route("/api/document", methods=["POST"])
 def upload_document():
+    """Accept an uploaded document, extract its text, and store it as active context."""
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
     f = request.files["file"]
@@ -251,8 +249,8 @@ def upload_document():
         document_context["text"]     = raw
         document_context["filename"] = filename
         wc = len(raw.split())
-        print(f"[Document] Loaded '{filename}' — {wc} words")
-        _reset_kv_cache()  # prompt prefix changed — invalidate cache
+        print(f"[Document] Loaded '{filename}', {wc} words")
+        _reset_kv_cache()
         return jsonify({"status": "loaded", "filename": filename, "word_count": wc})
     except Exception as e:
         print(f"[Document] Error: {e}")
@@ -260,19 +258,22 @@ def upload_document():
 
 @app.route("/api/document", methods=["DELETE"])
 def remove_document():
+    """Clear the currently active document context."""
     document_context["text"] = document_context["filename"] = ""
     _reset_kv_cache()
     return jsonify({"status": "cleared"})
 
 @app.route("/api/clear", methods=["POST"])
 def clear_history():
+    """Clear the stored conversation history."""
     conversation_history.clear()
     _reset_kv_cache()
     print("[Memory] Cleared.")
     return jsonify({"status": "cleared"})
 
 
-# ── Main chat endpoint ────────────────────────────────────────────────
+# Main conversational endpoint: accepts audio, transcribes it, generates a
+# response, and streams back transcript, text, and synthesized audio frames.
 @app.route("/api/chat", methods=["POST"])
 def voice_chat():
     if "audio" not in request.files:
@@ -283,35 +284,35 @@ def voice_chat():
     try:
         audio_data, sampling_rate = sf.read(io.BytesIO(audio_file.read()))
 
-        # ── Transcribe (Item 3: serialized against Gemma generation) ──
-        # faster-whisper manages its own CUDA/CPU execution internally
-        # (CTranslate2), but we keep it under gpu_lock since it shares
-        # the same physical GPU as Gemma and we don't want overlapping
-        # kernels from a barge-in transcription mid-generation.
+        # Transcription is serialized against Gemma generation. faster-whisper
+        # manages its own execution internally, but it shares the same
+        # physical GPU as Gemma, so overlapping kernels from a barge-in
+        # transcription mid-generation must be avoided.
         with gpu_lock:
             transcribed_text = transcribe_audio(audio_data, sampling_rate)
         print(f"\n[User Said]: {transcribed_text}")
 
         if is_hallucination(transcribed_text):
-            print("[Whisper] Hallucination — ignoring.")
+            print("[Whisper] Hallucination detected, ignoring.")
             return Response(pack_frame(FRAME_EMPTY, b""), mimetype="application/octet-stream")
 
-        # ── Save user turn ────────────────────────────────────────────
+        # Record the user turn.
         conversation_history.append({
             "role": "user",
             "content": [{"type": "text", "text": transcribed_text}],
         })
 
-        # Item 4: trim history so the prompt doesn't grow unbounded.
+        # Trim history so the prompt does not grow unbounded.
         if len(conversation_history) > MAX_HISTORY_TURNS:
             trimmed = len(conversation_history) - MAX_HISTORY_TURNS
             del conversation_history[:trimmed]
-            _reset_kv_cache()  # prefix shifted — cache no longer valid
+            _reset_kv_cache()
             print(f"[Memory] Trimmed {trimmed} old turn(s), kept last {MAX_HISTORY_TURNS}")
 
         print(f"[Memory] {len(conversation_history)} messages")
 
-        # ── Build prompt ──────────────────────────────────────────────
+        # Build the system instruction and prompt, depending on whether a
+        # document is currently active.
         if document_context["text"]:
             doc_block = (
                 f"\n\nYou have been given a document called '{document_context['filename']}'. "
@@ -321,7 +322,7 @@ def voice_chat():
                 f"--- DOCUMENT START ---\n{document_context['text']}\n--- DOCUMENT END ---"
             )
             system_instruction = (
-                "You are a strict document assistant. No general knowledge — "
+                "You are a strict document assistant. No general knowledge, "
                 "only the document below." + doc_block
             )
         else:
@@ -350,10 +351,10 @@ def voice_chat():
         if "attention_mask" not in cleaned:
             cleaned["attention_mask"] = torch.ones_like(cleaned["input_ids"]).to(input_device)
 
-        # ── Item 11: try to reuse KV cache from the previous turn ──────
-        # Only valid if this turn's input_ids start with exactly the same
-        # tokens as the cached prefix (i.e. doc + history prefix unchanged,
-        # this turn just appended new tokens on top).
+        # Attempt to reuse the KV cache from the previous turn. This is only
+        # valid when the current input_ids begin with exactly the same
+        # tokens as the cached prefix, meaning the document and history
+        # prefix are unchanged and only new tokens were appended.
         generation_kwargs = dict(**cleaned, max_new_tokens=256)
         with _kv_lock:
             prev_ids = _kv_cache_state["input_ids"]
@@ -365,7 +366,7 @@ def voice_chat():
                 and cur_ids.shape[1] > prev_ids.shape[1]
                 and torch.equal(cur_ids[:, :prev_ids.shape[1]], prev_ids)
             ):
-                # Feed only the new suffix tokens; reuse cached prefix compute.
+                # Feed only the new suffix tokens and reuse the cached prefix compute.
                 new_tokens = cur_ids[:, prev_ids.shape[1]:]
                 generation_kwargs["input_ids"] = new_tokens
                 generation_kwargs["past_key_values"] = prev_pkv
@@ -384,8 +385,8 @@ def voice_chat():
         generation_kwargs["use_cache"] = True
         generation_kwargs["return_dict_in_generate"] = False
 
-        # Item 3: hold the GPU lock for the whole generation so no other
-        # request (e.g. a barge-in transcription) can run concurrently.
+        # The GPU lock is held for the entire generation so that no other
+        # request, such as a barge-in transcription, can run concurrently.
         gpu_lock.acquire()
 
         gen_result_holder = {}
@@ -414,6 +415,7 @@ def voice_chat():
             MAX_BUFFER_CHARS = 45
 
             def kick_synth(s):
+                """Start synthesis for a sentence fragment if it meets the minimum length."""
                 if len(s.strip()) < MIN_SYNTH_CHARS:
                     return
                 t = threading.Thread(target=synth_sentence, args=(s, audio_q), daemon=True)
@@ -457,7 +459,7 @@ def voice_chat():
                 except queue.Empty:
                     break
 
-            # Persist assistant turn
+            # Persist the assistant turn to conversation history.
             assistant_text = "".join(full_reply).strip()
             conversation_history.append({
                 "role": "assistant",
@@ -465,21 +467,19 @@ def voice_chat():
             })
             print(f"[Memory] {len(conversation_history)} messages")
 
-            # Item 11: stash the new past_key_values + the input_ids that
-            # produced them (prompt tokens + generated tokens), so next
-            # turn can potentially reuse this prefix.
+            # Store the new past_key_values along with the input_ids that
+            # produced them, so the next turn can potentially reuse this
+            # prefix. With return_dict_in_generate=False, the generation
+            # output carries no cache, so a full prefill will occur on the
+            # next turn regardless. Enabling return_dict_in_generate=True
+            # with a compatible generation config would allow this reuse
+            # to take effect; left conservative here to avoid errors on
+            # library versions that do not support it.
             out = gen_result_holder.get("out")
             if out is not None and hasattr(out, "past_key_values") and out.past_key_values is not None:
                 with _kv_lock:
                     _kv_cache_state["past_key_values"] = out.past_key_values
                     _kv_cache_state["input_ids"] = out.sequences if hasattr(out, "sequences") else None
-            # Note: with return_dict_in_generate=False, `out` is just the
-            # sequences tensor and carries no cache — full prefill happens
-            # next turn. Set return_dict_in_generate=True + use a
-            # generation config that returns past_key_values if your
-            # transformers version supports it, to make reuse actually
-            # kick in. Left conservative here so this never crashes on
-            # library versions that don't support it.
 
         return Response(
             stream_with_context(generate_stream()),
